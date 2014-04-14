@@ -1,4 +1,4 @@
-gen_cuda
+gen-cuda
 ========
 
 CUDA Genetic Algorithm
