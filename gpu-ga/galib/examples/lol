@@ -1,0 +1,39 @@
+Example 26
+
+The Travelling Salesman Problem (TSP) demo program.
+
+initializing...evolving...10 20 30 40 50 60 70 80 90 100 110 120 130 140 150 160 170 180 190 200 210 220 230 240 250 260 270 280 290 300 310 320 330 340 350 360 370 380 390 400 410 420 430 440 450 460 470 480 490 500 510 520 530 540 550 560 570 580 590 600 610 620 630 640 650 660 670 680 690 700 710 720 730 740 750 760 770 780 790 800 810 820 830 840 850 860 870 880 890 900 910 920 930 940 950 960 970 980 990 1000 the shortest path found is 22.6503
+this is the distance from the sequence
+2 3 7 11 15 19 18 17 16 12 8 4 0 20 1 5 9 13 14 10 6 
+
+1000	# current generation
+1	# current convergence
+100000	# number of selections since initialization
+100000	# number of crossovers since initialization
+10058	# number of mutations since initialization
+100000	# number of replacements since initialization
+100100	# number of genome evaluations since initialization
+1001	# number of population evaluations since initialization
+63.8886	# maximum score since initialization
+22.6503	# minimum score since initialization
+22.9328	# average of all scores ('on-line' performance)
+22.977	# average of maximum scores ('off-line' performance)
+22.821	# average of minimum scores ('off-line' performance)
+
+54.5802	# mean score in initial population
+63.8886	# maximum score in initial population
+45.0099	# minimum score in initial population
+4.07251	# standard deviation of initial population
+-1	# diversity of initial population (0=identical,-1=unset)
+
+22.6503	# mean score in current population
+22.6503	# maximum score in current population
+22.6503	# minimum score in current population
+2.64234e-06	# standard deviation of current population
+-1	# diversity of current population (0=identical,-1=unset)
+
+20	# how far back to look for convergence
+100	# how often to record scores
+0	# how often to write scores to file
+generations.dat	# name of file to which scores are written
+

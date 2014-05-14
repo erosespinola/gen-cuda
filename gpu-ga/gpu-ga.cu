@@ -1,12 +1,12 @@
+// export LD_LIBRARY_PATH=/lib:/usr/lib:/usr/local/lib:/usr/local/cuda/lib64
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
 #include <cuda.h>
 
-#include <iostream>
-#include <algorithm>
-using namespace std;
+#include <sys/time.h>
 
 #include <thrust/sequence.h>
 #include <thrust/host_vector.h>
@@ -15,6 +15,12 @@ using namespace std;
 #include <thrust/random.h>
 #include <thrust/random/uniform_real_distribution.h>
 #include <thrust/extrema.h>
+
+#include <iostream>
+#include <iomanip>
+#include <fstream>
+#include <algorithm>
+using namespace std;
 
 #include "cuPrintf.cuh"
 #include "cuPrintf.cu"
@@ -34,203 +40,50 @@ inline void gpuAssert(cudaError_t code, char *file, int line, bool abort=true)
 
 typedef pair<float, float> city_t;
 
-const float ratio = 10.0;
-const float CROSSOVER_RATE = 0.7;
-const float MUTATION_RATE = 0.01;
+const float CROSSOVER_RATE = 1.0;
+const float MUTATION_RATE = 0.1;
 
-// Each gene has m chromosomes
-void initialize_genes(thrust::host_vector<int> &genes, int m, int n)
+//
+//  command line option processing
+//
+int find_option( int argc, char **argv, const char *option )
 {
-    for (int i = 0; i < n; i++) 
-    {
-        // traversal sequence
-        thrust::sequence(genes.begin() + (i * m), genes.begin() + (i * m) + m, 1, 1);
-
-        // random numbers for shuffling
-        // thrust::generate(offspring.begin() + (i * m), offspring.begin() + (i * m) + m, rand);
-
-        for (int j = 0; j < m; j++)
-        {
-            int r = rand() % m;
-
-            swap(genes[(i * m) + j], genes[(i * m) + r]);
-
-            // temp = genes[(i * m) + j];
-            // genes[(i * m) + j] = genes[(i * m) + r];
-            // genes[(i * m) + r] = temp;
-        }
-    }
+    for( int i = 1; i < argc; i++ )
+        if( strcmp( argv[i], option ) == 0 )
+            return i;
+    return -1;
 }
 
-void initialize_cities(thrust::host_vector<city_t> &cities, int m, int n) 
+int read_int( int argc, char **argv, const char *option, int default_value )
 {
-    for (int i = 0; i < m; i++)
-    {
-        cities[i] = make_pair(ratio * cos(i / float(m) * 6.28), ratio * sin(i / float(m) * 6.28));
-        // cout << cities[i].first << ", " << cities[i].second << endl;
-    }
+    int iplace = find_option( argc, argv, option );
+    if( iplace >= 0 && iplace < argc-1 )
+        return atoi( argv[iplace+1] );
+    return default_value;
 }
 
-void print_genes(thrust::host_vector<int> &genes, thrust::device_vector<int> &d_genes, int m, int n)
+char *read_string( int argc, char **argv, const char *option, char *default_value )
 {
-    thrust::copy(d_genes.begin(), d_genes.end(), genes.begin());
-
-    cout << endl;
-
-    for (int i = 0; i < n; i++) 
-    {
-        for (int j = 0; j < m; j++) 
-        {
-            printf("%d ", genes[i * m + j]);
-        }
-
-        printf("\n");
-    }
-
-    printf("\n");
+    int iplace = find_option( argc, argv, option );
+    if( iplace >= 0 && iplace < argc-1 )
+        return argv[iplace+1];
+    return default_value;
 }
 
-__device__ float individual_fitness(city_t *cities, int *current_gene, int m)
+double read_timer()
 {
-    float p_x = cities[0].first,
-          p_y = cities[0].second,
-          current_fitness = 0.0,
-          x, y;
-
-    for (int i = 0; i < m; i++)
+    static bool initialized = false;
+    static struct timeval start;
+    struct timeval end;
+    if( !initialized )
     {
-        int current_city = current_gene[i];
-
-        x = cities[current_city].first - p_x,
-        y = cities[current_city].second - p_y;
-
-        current_fitness += sqrt(x * x + y * y);
-
-        p_x = cities[current_city].first;
-        p_y = cities[current_city].second;
+        gettimeofday( &start, NULL );
+        initialized = true;
     }
-
-    x = cities[0].first - p_x;
-    y = cities[0].second - p_y;
-
-    current_fitness += sqrt(x * x + y * y);
-
-    return 1.0 / current_fitness;
+    gettimeofday( &end, NULL );
+    return (end.tv_sec - start.tv_sec) + 1.0e-6 * (end.tv_usec - start.tv_usec);
 }
 
-__global__ void compute_fitness(float *fitness, city_t *cities, int *genes, int m, int n)
-{
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
-    if (tid >= n) 
-    {
-        return;
-    }
-
-    fitness[tid] = individual_fitness(cities, &genes[tid * m], m);
-}
-
-// Tournament selection operator
-__global__ void selection(float *fitness, city_t *cities, int *genes, int *offspring, float *random, int *selections, int m, int n)
-{
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
-    if (tid >= n) 
-    {
-        return;
-    }
-
-    int vs = random[tid] * n;
-
-    selections[tid] = fitness[tid] > fitness[vs] ? tid : vs;
-}
-
-// PMX crossover operator
-__global__ void crossover(int *genes, int *offspring, float *random, int *selections, int m, int n)
-{
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    tid *= 2;
-
-    if (tid >= n) 
-    {
-        return;
-    }
-
-    // This kernel needs two random numbers, one for the random position of the crossover
-    // and another for the crossover rate comparison
-
-    int *parent1        = &genes[selections[tid] * m],
-        *parent2        = &genes[selections[tid + 1] * m],
-        *offspring1     = &offspring[tid * m],
-        *offspring2     = &offspring[(tid + 1) * m];
-
-    memcpy(offspring1, parent1, sizeof(int) * m);
-    memcpy(offspring2, parent2, sizeof(int) * m);
-
-    if (random[tid] > CROSSOVER_RATE)
-    {
-        return;
-    }
-
-    int crossover_point = random[tid + 1] * m;
-
-    // memcpy(parent2, parent2 + m, offspring2);
-
-    for (int i = 0; i <= crossover_point; i++)
-    {
-        // TODO: Optimize this N^2 search
-        for (int j = 0; j < m; j++)
-        {
-            if (offspring1[j] == parent2[i])
-            {
-                int temp = offspring1[i];
-                offspring1[i] = offspring1[j];
-                offspring1[j] = temp;
-
-                // swap(offspring1[i], offspring1[j]);
-            }
-        }
-    }
-
-    for (int i = 0; i <= crossover_point; i++)
-    {
-        // TODO: Optimize this N^2 search
-        for (int j = 0; j < m; j++)
-        {
-            if (offspring2[j] == parent1[i])
-            {
-                int temp = offspring2[i];
-                offspring2[i] = offspring2[j];
-                offspring2[j] = temp;
-
-                // swap(offspring2[i], offspring2[j]);
-            }
-        }
-    }
-}
-
-__global__ void mutation(float *fitness, city_t *cities, int *offspring, float *random, int m, int n)
-{
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
-    if (tid >= n) 
-    {
-        return;
-    }
-
-    if (random[tid] > MUTATION_RATE)
-    {
-        return;
-    }
-
-    int *target = &offspring[tid * m],
-        mutation_point1 = random[(tid + 1) % n],
-        mutation_point2 = random[(tid + 2) % n],
-        temp = target[mutation_point1];
-
-    target[mutation_point1] = target[mutation_point2];
-    target[mutation_point2] = temp;
-}
 
 __host__ __device__
 unsigned int hash(unsigned int a)
@@ -266,56 +119,376 @@ struct RandomNumberFunctor :
     }
 };
 
+// Each gene has m chromosomes
+void initialize_genes(thrust::host_vector<int> &genes, int m, int n)
+{
+    for (int i = 0; i < n; i++) 
+    {
+        // traversal sequence
+        thrust::sequence(genes.begin() + (i * m), genes.begin() + (i * m) + m, 0, 1);
+
+        for (int j = 0; j < m; j++)
+        {
+            int r = rand() % m;
+
+            swap(genes[(i * m) + j], genes[(i * m) + r]);
+        }
+    }
+}
+
+void print_genes(thrust::host_vector<int> &genes, thrust::device_vector<int> &d_genes, int m, int n)
+{
+    thrust::copy(d_genes.begin(), d_genes.end(), genes.begin());
+
+    printf("\n");
+
+    for (int i = 0; i < n; i++) 
+    {
+        for (int j = 0; j < m; j++) 
+        {
+            printf("%d ", genes[i * m + j]);
+        }
+
+        printf("\n");
+    }
+
+    printf("\n");
+}
+
+void compute_distances(thrust::host_vector< city_t > &cities, thrust::host_vector<float> &distances, int m)
+{
+    thrust::fill(distances.begin(), distances.end(), 0.0);
+
+    for (int i = 0; i < m; i++)
+    {
+        for (int j = 0; j < m; j++)
+        {
+            float x = cities[i].first - cities[j].first,
+                  y = cities[i].second - cities[j].second;
+
+            distances[i * m + j] = sqrt(x * x + y * y);
+        }
+    }
+}
+
+__host__ __device__ float individual_distance(float *distances, int *current_gene, int m)
+{
+    float total_distance = 0.0;
+
+    for (int i = 1; i < m; i++)
+    {
+        total_distance += distances[current_gene[i - 1] * m + current_gene[i]];
+    }
+
+    return total_distance + distances[current_gene[m - 1] * m + current_gene[0]];
+}
+
+__global__ void compute_fitness(float *fitness, float *distances, int *genes, int m, int n)
+{
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (tid >= n) 
+    {
+        return;
+    }
+
+    fitness[tid] = 1.0 / individual_distance(distances, &genes[tid * m], m);
+}
+
+// Tournament selection operator
+__global__ void selection(float *fitness, city_t *cities, int *genes, int *offspring, float *random, int *selections, int m, int n)
+{
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (tid >= n) 
+    {
+        return;
+    }
+
+    int vs = random[tid] * n;
+
+    selections[tid] = fitness[tid] > fitness[vs] ? tid : vs;
+}
+
+// 2-point PMX crossover operator
+__global__ void crossover(int *genes, int *offspring, float *random, int *selections, int *reverse_index, int m, int n)
+{
+    int tid = threadIdx.x + blockIdx.x * blockDim.x,
+        random_block = tid * 3;
+
+    tid *= 2;
+
+    if (tid >= n) 
+    {
+        return;
+    }
+
+    // This kernel needs two random numbers, one for the random position of the crossover
+    // and another for the crossover rate comparison
+
+    int *parent1        = &genes[selections[tid + 0] * m],
+        *parent2        = &genes[selections[tid + 1] * m],
+        *offspring1     = &offspring[(tid + 0) * m],
+        *offspring2     = &offspring[(tid + 1) * m],
+        *reverse_index1 = &reverse_index[(tid + 0) * m],
+        *reverse_index2 = &reverse_index[(tid + 1) * m];
+
+    memcpy(offspring1, parent1, sizeof(int) * m);
+    memcpy(offspring2, parent2, sizeof(int) * m);
+
+    if (random[random_block] > CROSSOVER_RATE)
+    {
+        return;
+    }
+
+    int crossover_point1 = random[random_block + 1] * m,
+        crossover_point2 = random[random_block + 2] * m;
+
+    int temp;
+
+    if (crossover_point1 > crossover_point2) 
+    {
+        temp = crossover_point1;
+        crossover_point1 = crossover_point2;
+        crossover_point2 = temp;
+    }
+
+    // Compute reverse index
+    // (avoids n^2 search)
+    for (int i = 0; i < m; i++) 
+    {
+        reverse_index1[offspring1[i]] = i;
+        reverse_index2[offspring2[i]] = i;
+    }
+
+    // for (int i = 0; i < m; i++) 
+    // {
+    //     cuPrintf("%d\n", offspring1[i]);
+    // }
+    // cuPrintf("\n");
+    // for (int i = 0; i < m; i++) 
+    // {
+    //     cuPrintf("%d\n", reverse_index1[i]);
+    // }
+    // cuPrintf("\n");
+
+    for (int i = crossover_point1; i <= crossover_point2; i++)
+    {
+        // TODO: Optimize this N^2 search
+        // int j;
+        // for (j = 0; j < m; j++)
+        // {
+        //     if (offspring1[j] == parent2[i])
+        //     {
+        //         // temp = offspring1[i];
+        //         // offspring1[i] = offspring1[j];
+        //         // offspring1[j] = temp;
+        //         break;
+        //     }
+        // }
+
+        // if (j != reverse_index1[parent2[i]])
+        // {
+        //     cuPrintf("1: %d != %d\n", j, reverse_index1[parent2[i]]);
+        //     // int *hats = (int*)0xffffffff;
+        //     // *hats = 12;
+        // }
+
+        int j = reverse_index1[parent2[i]];
+
+        temp = offspring1[i];
+        offspring1[i] = offspring1[j];
+        offspring1[j] = temp;
+
+        // Swap reverse index
+        temp = reverse_index1[offspring1[j]];
+        reverse_index1[offspring1[j]] = reverse_index1[offspring1[i]];
+        reverse_index1[offspring1[i]] = temp;
+    }
+
+    for (int i = crossover_point1; i <= crossover_point2; i++)
+    {
+        // TODO: Optimize this N^2 search
+        // int j;
+        // for (j = 0; j < m; j++)
+        // {
+        //     if (offspring2[j] == parent1[i])
+        //     {
+        // //         temp = offspring2[i];
+        // //         offspring2[i] = offspring2[j];
+        // //         offspring2[j] = temp;
+        //         break;
+        //     }
+        // }
+
+        // if (j != reverse_index2[parent1[i]])
+        // {
+        //     cuPrintf("2: %d != %d\n", j, reverse_index2[parent1[i]]);
+        //     // int *hats = (int*)0xffffffff;
+        //     // *hats = 12;
+        // }
+
+        int j = reverse_index2[parent1[i]];
+
+        temp = offspring2[i];
+        offspring2[i] = offspring2[j];
+        offspring2[j] = temp;
+
+        // Swap reverse index
+        temp = reverse_index2[offspring2[j]];
+        reverse_index2[offspring2[j]] = reverse_index2[offspring2[i]];
+        reverse_index2[offspring2[i]] = temp;
+        // temp = reverse_index2[j];
+        // reverse_index2[j] = reverse_index2[i];
+        // reverse_index2[i] = temp;
+    }
+}
+
+__global__ void mutation(int *offspring, float *random, int m, int n)
+{
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (tid >= n) 
+    {
+        return;
+    }
+
+    if (random[tid] > MUTATION_RATE)
+    {
+        return;
+    }
+
+    int *target = &offspring[tid * m],
+        mutation_point1 = random[(tid + 1) % n],
+        mutation_point2 = random[(tid + 2) % n],
+        temp = target[mutation_point1];
+
+    target[mutation_point1] = target[mutation_point2];
+    target[mutation_point2] = temp;
+}
+
+void read_cities(istream &in, thrust::host_vector<city_t> &cities) 
+{
+    float x, y;
+    int m;
+
+    in >> m;
+
+    cities.resize(m);
+
+    for (int i = 0; i < m; i++)
+    {
+        in >> x >> y;
+        cities[i] = make_pair(x, y);
+        cout << cities[i].first << " " << cities[i].second << endl;
+    }
+}
+
 int main(int argc, char **argv)
 {    
+    unsigned int seed = time(NULL);
+
+    srand(time(NULL));
+
     cudaDeviceSynchronize(); 
 
-    unsigned long seed = time(NULL);
+    if (find_option(argc, argv, "-h") >= 0)
+    {
+        printf("Options:\n");
+        printf("-h to see this help\n");
+        printf("-n <int> to set the number of genes in the population\n");
+        printf("-s <int> to set the number of generations to be simulated\n");
+        printf("-i <filename> to specify the input file name\n");
+        printf("-o <filename> to specify the output file name\n");
 
-    srand(seed);
+        return 0;
+    }
+    
+    int n = read_int(argc, argv, "-n", 1 << 12),
+        steps = read_int(argc, argv, "-s", 1000);
 
-    int m = 20,
-        n = 1 << 12;
+    char *input_file = read_string(argc, argv, "-i", "default.in");
+    char *output_file = read_string(argc, argv, "-o", "result-gpu.txt");
+
+    ifstream input(input_file);
+    ofstream output(output_file);
+
+    thrust::host_vector<city_t> cities;
+
+    read_cities(input, cities);
+
+    int m = cities.size();
 
     // GPU genes data structure
-    int *d_genes_raw, *d_offspring_raw, *d_selections_raw;
-    float *d_fitness_raw, *d_random_raw;
+    int *d_genes_raw, *d_offspring_raw, *d_selections_raw, *d_reverse_index_raw;
+    float *d_fitness_raw, *d_random_raw, *d_distances_raw;
     city_t *d_cities_raw;
 
     thrust::host_vector<int> genes(m * n);
     thrust::host_vector<int> offspring(m * n);
-    thrust::host_vector<city_t> cities(n);
+    thrust::host_vector<float> distances(m * m);
     thrust::host_vector<float> fitness(n);
-    thrust::host_vector<float> random(n);
+    thrust::host_vector<float> random(4 * n);
     thrust::host_vector<int> selections(n);
 
     thrust::device_vector<int> d_genes;
     thrust::device_vector<int> d_offspring;
+    thrust::device_vector<float> d_distances;
+    thrust::device_vector<int> d_reverse_index(m * n * 2);
     thrust::device_vector<city_t> d_cities;
     thrust::device_vector<float> d_fitness;
-    thrust::device_vector<float> d_random(n);
+    thrust::device_vector<float> d_random(4 * n);
     thrust::device_vector<int> d_selections(n);
 
     int blks = (n + NUM_THREADS - 1) / NUM_THREADS;
 
     initialize_genes(genes, m, n);
-    initialize_cities(cities, m, n);
+    compute_distances(cities, distances, m);
+
+    // for (int i = 0; i < m; i++)
+    // {
+    //     for (int j = 0; j < m; j++)
+    //     {
+    //         cout << setprecision(2) << fixed << distances[i * m + j] << " ";
+    //     }
+    //     cout << endl;
+
+    // }
+
+    // cout << "TEST" << endl;
+    // int test_gene[1000];
+
+    // for (int i = 0; i < m; i++)
+    // {
+    //     for (int j = 0; j < m; j++)
+    //     {
+    //         test_gene[j] = (i + j) % m;
+    //         cout << test_gene[j] << " ";
+    //     }
+    //     cout << ": " << individual_distance(&distances[0], test_gene, m) << endl;
+    // }
 
     d_genes = genes;
     d_offspring = offspring;
-    d_cities = cities;
+    // d_cities = cities;
     d_fitness = fitness;
+    d_distances = distances;
 
     // print_genes(genes, d_genes, m, n);
 
-    for (int step = 0; step < 1000; step++)
+    d_fitness_raw = thrust::raw_pointer_cast(&d_fitness[0]);
+    d_genes_raw = thrust::raw_pointer_cast(&d_genes[0]);
+    d_distances_raw = thrust::raw_pointer_cast(&d_distances[0]);
+    // d_cities_raw = thrust::raw_pointer_cast(&d_cities[0]);
+    d_reverse_index_raw = thrust::raw_pointer_cast(&d_reverse_index[0]);
+
+    double simulation_time = read_timer();
+
+    cudaPrintfInit ();
+    for (int step = 0; step < steps; step++)
     {
-        d_fitness_raw = thrust::raw_pointer_cast(&d_fitness[0]);
-        d_genes_raw = thrust::raw_pointer_cast(&d_genes[0]);
-        d_cities_raw = thrust::raw_pointer_cast(&d_cities[0]);
-        
         // Compute fitness for all genes
-        compute_fitness <<< blks, NUM_THREADS >>> (d_fitness_raw, d_cities_raw, d_genes_raw, m, n);
+        compute_fitness <<< blks, NUM_THREADS >>> (d_fitness_raw, d_distances_raw, d_genes_raw, m, n);
 
         gpuErrchk( cudaPeekAtLastError() );
         gpuErrchk( cudaDeviceSynchronize() );
@@ -330,37 +503,33 @@ int main(int argc, char **argv)
         d_random_raw = thrust::raw_pointer_cast(&d_random[0]);
         d_selections_raw = thrust::raw_pointer_cast(&d_selections[0]);
 
-        // Generate random numbers
+        // Generate 4n random numbers
         thrust::transform(thrust::counting_iterator<int>(0),
-                          thrust::counting_iterator<int>(n),
-                          d_random.begin(), RandomNumberFunctor(seed));
+                          thrust::counting_iterator<int>(4 * n),
+                          d_random.begin(), 
+                          RandomNumberFunctor(seed));
 
+        // Uses n random numbers
         selection <<< blks, NUM_THREADS >>> (d_fitness_raw, d_cities_raw, d_genes_raw, d_offspring_raw, d_random_raw, d_selections_raw, m, n);
 
         gpuErrchk( cudaPeekAtLastError() );
         gpuErrchk( cudaDeviceSynchronize() );
 
-        // Generate random numbers
-        thrust::transform(thrust::counting_iterator<int>(0),
-                          thrust::counting_iterator<int>(n),
-                          d_random.begin(), RandomNumberFunctor(seed));
-        
-        crossover <<< blks, NUM_THREADS >>> (d_genes_raw, d_offspring_raw, d_random_raw, d_selections_raw, m, n);
+        d_random_raw = thrust::raw_pointer_cast(&d_random[n]);  
+
+        // Uses 2n random numbers
+        crossover <<< blks, NUM_THREADS >>> (d_genes_raw, d_offspring_raw, d_random_raw, d_selections_raw, d_reverse_index_raw, m, n);
 
         gpuErrchk( cudaPeekAtLastError() );
         gpuErrchk( cudaDeviceSynchronize() );
 
-        // Generate random numbers
-        thrust::transform(thrust::counting_iterator<int>(0),
-                          thrust::counting_iterator<int>(n),
-                          d_random.begin(), RandomNumberFunctor(seed));
+        d_random_raw = thrust::raw_pointer_cast(&d_random[3 * n]);
         
         // Mutation
-        mutation <<< blks, NUM_THREADS >>> (d_fitness_raw, d_cities_raw, d_offspring_raw, d_random_raw, m, n);
+        // Uses n random numbers
+        mutation <<< blks, NUM_THREADS >>> (d_offspring_raw, d_random_raw, m, n);
 
-        // TODO should swap instead
-        // swap(d_genes, d_offspring);
-        thrust::copy(d_offspring.begin(), d_offspring.end(), d_genes.begin());
+        swap(d_genes, d_offspring);
 
         // print_genes(offspring, d_offspring, m, n);
         
@@ -372,25 +541,26 @@ int main(int argc, char **argv)
         gpuErrchk( cudaDeviceSynchronize() );
     }
 
-    compute_fitness <<< blks, NUM_THREADS >>> (d_fitness_raw, d_cities_raw, d_genes_raw, m, n);
+    cudaPrintfDisplay (stdout, true);
+    cudaPrintfEnd ();
+
+    simulation_time = read_timer() - simulation_time;
+    cout << simulation_time;
+
+    // print_genes(offspring, d_offspring, m, n);
+
+    compute_fitness <<< blks, NUM_THREADS >>> (d_fitness_raw, d_distances_raw, d_genes_raw, m, n);
     thrust::copy(d_fitness.begin(), d_fitness.end(), fitness.begin());
-    // cout << endl;
-    // for (int i = 0; i < n; i++)
-    // {
-    //     cout << fitness[i] << endl;
-    // }
-
-    int the_best = thrust::max_element(fitness.begin(), fitness.begin() + n) - fitness.begin();
-    cout << the_best << " : " << fitness[the_best] << endl;
-
+    thrust::copy(d_genes.begin(), d_genes.end(), genes.begin());
     thrust::copy(d_offspring.begin(), d_offspring.end(), offspring.begin());
+
+    int the_best = thrust::distance(fitness.begin(), thrust::max_element(fitness.begin(), fitness.begin() + n));
+    cout << "OMG: " << the_best << " : " << (1.0 / fitness[the_best]) << endl;
+    output << (1.0 / fitness[the_best]) << endl;
     for (int i = 0; i < m; i++)
     {
-        cout << offspring[the_best * m + i] << " ";
+        output << offspring[the_best * m + i] << " ";
     }
-    cout << endl;
-
-    // print_genes(genes, d_genes, m, n);
 
     return 0;
 }
